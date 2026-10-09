@@ -378,11 +378,23 @@ bool PKG::Extract(const std::filesystem::path &filepath,
   LOG_DEBUG(Common, "Inizio parsing blocchi PFS, num_blocks: {}", num_blocks);
   for (int i = 0; i < num_blocks; i++) {
     const u64 sectorOffset = sectorMap[i];
-    u64 sectorSize = sectorMap[i + 1] - sectorOffset;
+    const u64 sectorEnd = sectorMap[i + 1];
 
-    // FIX: clamp to the bytes actually present in the staging buffer.
-    if (sectorOffset + sectorSize > pfsc.size())
-      sectorSize = pfsc.size() > sectorOffset ? pfsc.size() - sectorOffset : 0;
+    // FIX: reject a corrupt sector-map pair before subtracting or forming a
+    // pointer. A decreasing pair wraps the unsigned subtraction (and the clamp
+    // with it) and an offset past the buffer makes pfsc.data() + sectorOffset
+    // an invalid pointer even when the copy length is zero.
+    if (sectorEnd < sectorOffset || sectorOffset >= pfsc.size()) {
+      LOG_ERROR(Common,
+                "Mappa settori corrotta al blocco {} (offset={:#x}, end={:#x}), "
+                "parsing interrotto",
+                i, sectorOffset, sectorEnd);
+      break;
+    }
+    // Clamp to the bytes actually present in the staging buffer.
+    u64 sectorSize = sectorEnd - sectorOffset;
+    if (sectorSize > pfsc.size() - sectorOffset)
+      sectorSize = pfsc.size() - sectorOffset;
     compressedData.resize(sectorSize);
     std::memcpy(compressedData.data(), pfsc.data() + sectorOffset, sectorSize);
 
@@ -438,6 +450,12 @@ bool PKG::Extract(const std::filesystem::path &filepath,
         LOG_DEBUG(Common, "Dirent uroot: ino={}, entsize={}", dirent.ino,
                   dirent.entsize);
         if (dirent.ino != 0) {
+          // FIX: validate the entry size before counting it, so a corrupt
+          // entry cannot inflate the inode counter.
+          if (ent_size == 0 ||
+              ent_size > (int)decompressedData.size() - k) {
+            break;
+          }
           ndinode_counter++;
         } else {
           // Imposta la cartella base per l'estrazione.
@@ -445,10 +463,6 @@ bool PKG::Extract(const std::filesystem::path &filepath,
           // scelta dall'utente. Tutto verrà estratto sotto extract_path.
           extractPaths[ndinode_counter] = extract_path;
           uroot_reached = false;
-          break;
-        }
-        if (ent_size == 0 ||
-            ent_size > (int)decompressedData.size() - k) {
           break;
         }
         k += ent_size;
@@ -478,6 +492,12 @@ bool PKG::Extract(const std::filesystem::path &filepath,
         }
 
         ent_size = dirent.entsize;
+        // FIX: validate the entry size before touching fsTable/extractPaths,
+        // so a corrupt entry cannot land in the table before the walk stops.
+        if (ent_size == 0 ||
+            ent_size > (int)decompressedData.size() - j) {
+          break;
+        }
         auto &table = fsTable.emplace_back();
         int namelen = dirent.namelen;
         if (namelen < 0 || namelen > (int)sizeof(dirent.name))
@@ -500,10 +520,6 @@ bool PKG::Extract(const std::filesystem::path &filepath,
           ndinode_counter++;
           if ((ndinode_counter + 1) == ndinode)
             end_reached = true;
-        }
-        if (ent_size == 0 ||
-            ent_size > (int)decompressedData.size() - j) {
-          break;
         }
         j += ent_size;
       }
@@ -609,9 +625,15 @@ void PKG::ExtractFiles(const int index) {
     for (int j = 0; j < nblocks; j++) {
       // FIX: bounds-check the sector map accesses and clamp the copy length so
       // a corrupt loc/Blocks pair cannot read past the sector map or the
-      // 0x11000-byte staging buffers.
-      if (sector_loc + j + 1 >= (int)sectorMap.size()) {
-        LOG_ERROR(Common, "ExtractFiles: sector map overrun, truncated");
+      // 0x11000-byte staging buffers. A negative loc is rejected explicitly
+      // (loc == -1 would otherwise wrap to a passing index at j == 0) and the
+      // range check uses size_t arithmetic so it cannot overflow.
+      if (sector_loc < 0 ||
+          (size_t)sector_loc + (size_t)j + 1 >= sectorMap.size()) {
+        LOG_ERROR(Common,
+                  "ExtractFiles: inode {} loc={} blocks={}: sector map "
+                  "overrun, truncated",
+                  inode_number, sector_loc, nblocks);
         break;
       }
       u64 sectorOffset =
@@ -714,9 +736,25 @@ std::vector<u8> PKG::GetFileBuffer(const std::string &filename) {
   
   if (inode_type != PFS_FILE) return {}; 
 
+  // FIX: validate the inode index before using it as an array subscript.
+  if (inode_number < 0 || inode_number >= (int)iNodeBuf.size()) {
+    LOG_ERROR(Common, "GetFileBuffer: inode {} out of range", inode_number);
+    return {};
+  }
+
   int sector_loc = iNodeBuf[inode_number].loc;
   int nblocks = iNodeBuf[inode_number].Blocks;
   int bsize = iNodeBuf[inode_number].Size;
+
+  // FIX: same sector-index validation as ExtractFiles: a negative loc would
+  // index before the map and a truncated one past its end.
+  if (sector_loc < 0 || nblocks < 0 ||
+      (size_t)sector_loc + 1 >= sectorMap.size()) {
+    LOG_ERROR(Common,
+              "GetFileBuffer: inode {} con loc={} / blocks={} non valido",
+              inode_number, sector_loc, nblocks);
+    return {};
+  }
 
   std::vector<u8> resultBuffer;
   resultBuffer.reserve(bsize);
@@ -733,13 +771,23 @@ std::vector<u8> PKG::GetFileBuffer(const std::string &filename) {
   std::vector<u8> pfs_decrypted(pfsc_buf_size);
 
   for (int j = 0; j < nblocks; j++) {
+      // FIX: bounds-check the sector map accesses (see ExtractFiles); size_t
+      // arithmetic avoids a signed overflow of sector_loc + j + 1.
+      if ((size_t)sector_loc + (size_t)j + 1 >= sectorMap.size()) {
+        LOG_ERROR(Common, "GetFileBuffer: sector map overrun, truncated");
+        break;
+      }
       u64 sectorOffset = sectorMap[sector_loc + j];
       u64 sectorSize = sectorMap[sector_loc + j + 1] - sectorOffset;
+      if (sectorSize > 0x10000)
+        sectorSize = 0x10000;
       u64 fileOffset = (pkgheader.pfs_image_offset + pfsc_offset + sectorOffset);
       u64 currentSector1 = (pfsc_offset + sectorOffset) / 0x1000;
 
-      int sectorOffsetMask = (sectorOffset + pfsc_offset) & 0xFFFFF000;
-      int previousData = (sectorOffset + pfsc_offset) - sectorOffsetMask;
+      // FIX: keep the staging offset as in ExtractFiles. The old int math
+      // truncated to 32 bits and could make previousData negative on images
+      // larger than 2GiB, forming a pointer before pfs_decrypted.
+      u64 previousData = (u64)(sectorOffset + pfsc_offset) & 0xFFF;
 
       pkgFile.Seek(fileOffset - previousData);
       pkgFile.Read(pfsc);
@@ -749,6 +797,9 @@ std::vector<u8> PKG::GetFileBuffer(const std::string &filename) {
         crypto.decryptPFS(dataKey, tweakKey, pfsc, pfs_decrypted, currentSector1);
       }
       
+      // FIX: clamp the copy length to the staging buffer (see ExtractFiles).
+      if (previousData + sectorSize > pfsc_buf_size)
+        sectorSize = pfsc_buf_size - previousData;
       compressedData.resize(sectorSize);
       std::memcpy(compressedData.data(), pfs_decrypted.data() + previousData, sectorSize);
 
@@ -761,7 +812,10 @@ std::vector<u8> PKG::GetFileBuffer(const std::string &filename) {
 
       u32 write_size = 0x10000;
       if (j == nblocks - 1) {
+         // FIX: clamp the tail write so a wrong Size cannot over-read the block.
          write_size = decompressedData.size() - (size_decompressed - bsize);
+         if ((int)write_size < 0 || write_size > decompressedData.size())
+            write_size = decompressedData.size();
       }
       
       resultBuffer.insert(resultBuffer.end(), 
@@ -953,10 +1007,20 @@ bool PKG::Scan(const std::filesystem::path &filepath, std::string &failreason,
 
   for (int i = 0; i < (int)sectorMap.size() - 1; i++) {
     const u64 sectorOffset = sectorMap[i];
-    u64 sectorSize = sectorMap[i + 1] - sectorOffset;
-    // FIX: clamp to the bytes actually present in the staging buffer.
-    if (sectorOffset + sectorSize > pfsc.size())
-      sectorSize = pfsc.size() > sectorOffset ? pfsc.size() - sectorOffset : 0;
+    const u64 sectorEnd = sectorMap[i + 1];
+    // FIX: reject a corrupt sector-map pair before subtracting or forming a
+    // pointer (see PKG::Extract).
+    if (sectorEnd < sectorOffset || sectorOffset >= pfsc.size()) {
+      LOG_ERROR(Common,
+                "Scan: mappa settori corrotta al blocco {} (offset={:#x}, "
+                "end={:#x}), parsing interrotto",
+                i, sectorOffset, sectorEnd);
+      break;
+    }
+    // Clamp to the bytes actually present in the staging buffer.
+    u64 sectorSize = sectorEnd - sectorOffset;
+    if (sectorSize > pfsc.size() - sectorOffset)
+      sectorSize = pfsc.size() - sectorOffset;
     compressedData.resize(sectorSize);
     std::memcpy(compressedData.data(), pfsc.data() + sectorOffset, sectorSize);
     if (sectorSize == 0x10000)
@@ -997,14 +1061,16 @@ bool PKG::Scan(const std::filesystem::path &filepath, std::string &failreason,
         std::memcpy(&dirent, &decompressedData[k], sizeof(dirent));
         ent_size = dirent.entsize;
         if (dirent.ino != 0) {
+          // FIX: validate the entry size before counting it, so a corrupt
+          // entry cannot inflate the inode counter.
+          if (ent_size == 0 ||
+              ent_size > (int)decompressedData.size() - k) {
+            break;
+          }
           ndinode_counter++;
         } else {
           extractPaths[ndinode_counter] = extract_path;
           uroot_reached = false;
-          break;
-        }
-        if (ent_size == 0 ||
-            ent_size > (int)decompressedData.size() - k) {
           break;
         }
         k += ent_size;
@@ -1026,6 +1092,12 @@ bool PKG::Scan(const std::filesystem::path &filepath, std::string &failreason,
         if (dirent.ino == 0)
           break;
         ent_size = dirent.entsize;
+        // FIX: validate the entry size before touching fsTable/extractPaths,
+        // so a corrupt entry cannot land in the table before the walk stops.
+        if (ent_size == 0 ||
+            ent_size > (int)decompressedData.size() - j) {
+          break;
+        }
         auto &table = fsTable.emplace_back();
         int namelen = dirent.namelen;
         if (namelen < 0 || namelen > (int)sizeof(dirent.name))
@@ -1045,10 +1117,6 @@ bool PKG::Scan(const std::filesystem::path &filepath, std::string &failreason,
           ndinode_counter++;
           if ((ndinode_counter + 1) == ndinode)
             end_reached = true;
-        }
-        if (ent_size == 0 ||
-            ent_size > (int)decompressedData.size() - j) {
-          break;
         }
         j += ent_size;
       }
